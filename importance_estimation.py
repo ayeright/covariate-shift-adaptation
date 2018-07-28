@@ -7,50 +7,27 @@ Created on Mon Jul  9 16:18:13 2018
 
 import numpy as np
 import torch
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 import collections
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-class LRIF(object):
+class PCIF(object):
     """
-    Logistic Regression Importance Fitting.
+    Probabilistic Classifier Importance Fitting.
     
-    Trains a regularised logistic regression classifier to distinguish 
-    between samples from training and test distributions. Then given a feature
-    vector x, we can use the trained probabilistic classifier along with
-    Bayes' rule to estimate the probability density ratio w(x) as follows:
+    Trains a probabilistic classifier to distinguish between samples from 
+    training and test distributions. Then given a feature vector x, we can use 
+    the trained classifier along with Bayes' rule to estimate the probability 
+    density ratio w(x) as follows:
         
     w(x) = n_tr * p(test|x) / n_te * p(train|x),
     
     where n_tr and n_te are the number of training and test samples used to
     fit the model respectively, and p(train|x) and p(test|x) are the 
     probabilities that x was sampled from the training and test distributions
-    respectively, as predicted by the logistic regression classifier.
+    respectively, as predicted by the trained classifier.
     
-    Parameters
-    ----------
-    
-    penalty: string, "l1" or "l2" (default="l1")
-        Specifies the penalty norm used for regularisation.
-        
-    scoring: string, callable or None (default="roc_auc")
-        A string specifying an sklearn scoring function or a callable which
-        implements a custom scorer to use for model selection. 
-        Only used if multiple values of the regularisation parameter
-        are passed to the fit method.
-        
-    cv: int, cross-validation generator, an iterable or None (default=5)
-        Determines the cross-validation strategy used for model selection. 
-        Only used if multiple values of the regularisation parameter
-        are passed to the fit method. 
-        
-    n_jobs: integer or None (default=1)
-        Number of jobs to run in parallel during model selection.
-        Only used if multiple values of the regularisation parameter
-        are passed to the fit method. 
-        
     Attributes
     ----------
     
@@ -60,58 +37,44 @@ class LRIF(object):
     n_te_: integer
         Number of samples from test distribution used to fit the model.
            
-    coef_: numpy array
-        Coefficients of fitted logistic regression model.
-           
-    intercept_: numpy array
-        Intercept of fitted logistic regression model.
+    estimator_: estimator with scikit-learn interface
+        Fitted probabilistic classifier.
     """
 
-    def __init__(self,
-                penalty="l1", 
-                scoring="roc_auc",
-                cv=5,
-                n_jobs=1):
-        
-        # parameters
-        self.penalty = penalty
-        self.scoring = scoring
-        self.cv = cv
-        self.n_jobs = n_jobs
+    def __init__(self):
         
         # attributes
         self.n_tr_ = None
         self.n_te_ = None
-        self.coef_ = None
-        self.intercept_ = None
+        self.estimator_ = None
         
     
     def fit(self,
+            estimator,
             X_tr,
-            X_te,
-            lam=1):
+            X_te):
         """
-        Fits a regularised logistic regression classifier to the 
-        input training and test data.
+        Fits a probabilistic classifier to the input training and test data
+        to predict p(test|x).
         
-        - If a scalar provided for regularisation strength (lam),
-        the model with this hyperparameter is fit to the data.
+        - If an estimator with the scikit-learn interface is provided,
+        this estimator is fit to the data.
         
-        - If more than one value provided for the regularisation strength, 
-        a hyperparameter search is performed and the model with the best
-        parameter is subsequently fit to the data.
+        - If scikit-learn GridSearchCV or RandomizedSearchCV object provided,
+        model selection is run and the best estimator is subsequently fit to 
+        all the data.
         
         Parameters
         ----------
+        
+        estimator: estimator or sklearn.model_selection.GridSearchCV/RandomizedSearchCV
+            If estimator, assumed to implement the scikit-learn estimator interface.
         
         X_tr: numpy array
             Input data from training distribution, where each row is a feature vector.
             
         X_te: numpy array
             Input data from test distribution, where each row is a feature vector.
-            
-        lam: scalar or iterable (default=1)
-            Regularisation strength. If iterable, hyperparameter search will be run.
         """
         
         # construct the target (1 if test, 0 if train)
@@ -126,52 +89,35 @@ class LRIF(object):
         X = X[i_shuffle]
         y = y[i_shuffle]
         
-        # check if we need to run a hyperparameter search
-        search_lam = isinstance(lam, (collections.Sequence, np.ndarray)) and \
-                        (len(lam) > 1)
-        if search_lam:
-            print("Running hyperparameter search...")
-            C_range = [1. / x for x in lam]
-            mdl = LogisticRegression(penalty=self.penalty)
-            grid_search = GridSearchCV(mdl,
-                                       param_grid={"C": C_range},
-                                       scoring=self.scoring,
-                                       n_jobs=self.n_jobs,
-                                       cv=self.cv,
-                                       refit=True,
-                                       return_train_score=False)
-            grid_search.fit(X, y)
-            mdl = grid_search.best_estimator_
-            print("Best", self.scoring, "= {} with lambda = {}".format(
-                    grid_search.best_score_, 1. / grid_search.best_params_["C"]))
-            print("Using best model.")
-        else:
-            print("Fitting model...")
-            if isinstance(lam, (collections.Sequence, np.ndarray)):
-                lam = lam[0]
-            C = 1. / lam
-            mdl = LogisticRegression(penalty=self.penalty, C=C)
+        # fit estimator
+        if isinstance(estimator, GridSearchCV) or isinstance(estimator, RandomizedSearchCV):
+            print("Running model selection...")
+            estimator.refit = True
+            estimator.fit(X, y)
             print("Done!")
-        
-        # save fitted model parameters
-        self.coef_ = mdl.coef_
-        self.intercept_ = mdl.intercept_
-        
+            print("Best score = {}".format(estimator.best_score_))
+            print("Using best estimator.") 
+            self.estimator_ = estimator.best_estimator_
+        else:
+            print("Fitting estimator...")
+            self.estimator_ = estimator.fit(X, y)
+            print("Done!")
+               
     
     def predict(self,
                 X):
         """
         Estimates importance weights for input data.
         
-        For each feature vector x, the trained logistic regression
-        classifier is used to estimate the probability density ratio
+        For each feature vector x, the trained probabilistic classifier 
+        is used to estimate the probability density ratio
             
         w(x) = n_tr * p(test|x) / n_te * p(train|x),
         
         where n_tr and n_te are the number of training and test samples used to
-        train the model respectively, and p(train|x) and p(test|x) are
+        train the model respectively, and p(train|x) and p(test|x) are the
         probabilities that x was sampled from the training and test distributions
-        respectively, as predicted by the logistic regression classifier.
+        respectively, as predicted by the trained classifier.
         
         Parameters
         ----------
@@ -187,9 +133,14 @@ class LRIF(object):
             w[i] corresponds to importance weight of X[i]
         """
         
-        assert self.coef_ is not None, "Need to run fit method before calling predict!"
+        assert self.estimator_ is not None, "Need to run fit method before calling predict!"
                
-        w = (self.n_tr_ / self.n_te_) * np.exp(X @ self.coef_.T + self.intercept_).squeeze()       
+        p = self.estimator_.predict_proba(X)
+        if len(p.shape) == 1:
+            w = (self.n_tr_ / self.n_te_) * (p / (1 - p))
+        else:
+            w = (self.n_tr_ / self.n_te_) * (p[:, 1] / p[:, 0])
+            
         return w
 
     
@@ -285,50 +236,52 @@ class uLSIF(object):
             Numpy random seed.
         """
         
-        np.random.seed(random_seed)
+        with torch.no_grad():
         
-        # convert training and test data to torch tensors
-        X_tr = torch.from_numpy(X_tr).float().to(DEVICE)
-        X_te = torch.from_numpy(X_te).float().to(DEVICE)
+            np.random.seed(random_seed)
+            
+            # convert training and test data to torch tensors
+            X_tr = torch.from_numpy(X_tr).float().to(DEVICE)
+            X_te = torch.from_numpy(X_te).float().to(DEVICE)
+            
+            # randomly choose kernel centres from X_te without replacement
+            n_te = X_te.size(0)
+            t = min(self.n_kernels, X_te.size(0)) 
+            self.C_ = X_te[np.random.choice(n_te, t, replace=False)] # shape (t, d)
+            
+            # compute the squared l2-norm of the difference between 
+            # every point in X_tr and every point in C,
+            # element (l, i) should contain the squared l2-norm
+            # between C[l] and X_tr[i]
+            print("Computing distance matrix for X_train...")
+            D_tr = self.pairwise_euclidean_distance_squared(self.C_, X_tr) # shape (t, n_tr)
         
-        # randomly choose kernel centres from X_te without replacement
-        n_te = X_te.size(0)
-        t = min(self.n_kernels, X_te.size(0)) 
-        self.C_ = X_te[np.random.choice(n_te, t, replace=False)] # shape (t, d)
-        
-        # compute the squared l2-norm of the difference between 
-        # every point in X_tr and every point in C,
-        # element (l, i) should contain the squared l2-norm
-        # between C[l] and X_tr[i]
-        print("Computing distance matrix for X_train...")
-        D_tr = self.pairwise_euclidean_distance_squared(self.C_, X_tr) # shape (t, n_tr)
-    
-        # do the same for X_te
-        print("Computing distance matrix for X_test...")
-        D_te = self.pairwise_euclidean_distance_squared(self.C_, X_te) # shape (t, n_te)        
-        
-        # check if we need to run a hyperparameter search
-        search_sigma = isinstance(sigma, (collections.Sequence, np.ndarray)) and \
-                        (len(sigma) > 1)
-        search_lam = isinstance(lam, (collections.Sequence, np.ndarray)) and \
-                        (len(lam) > 1)
-        if search_sigma | search_lam:
-            print("Running hyperparameter search...")
-            sigma, lam = self.loocv(X_tr, D_tr, X_te, D_te, sigma, lam)
-        else:
-            if isinstance(sigma, (collections.Sequence, np.ndarray)):
-                sigma = sigma[0]
-            if isinstance(lam, (collections.Sequence, np.ndarray)):
-                lam = lam[0]
-                
-        print("Computing optimal solution...")    
-        X_tr = self.gaussian_kernel(D_tr, sigma)  # shape (t, n_tr)
-        X_te = self.gaussian_kernel(D_te, sigma) # shape (t, n_te)
-        H, h = self.kernel_arrays(X_tr, X_te) # shapes (t, t) and (t, 1)
-        alpha = (H + (lam * torch.eye(t)).to(DEVICE)).inverse().mm(h) # shape (t, 1)
-        self.alpha_ = torch.max(torch.zeros(1).to(DEVICE), alpha) # shape (t, 1)
-        self.sigma_ = sigma
-        print("Done!")
+            # do the same for X_te
+            print("Computing distance matrix for X_test...")
+            D_te = self.pairwise_euclidean_distance_squared(self.C_, X_te) # shape (t, n_te)        
+            
+            # check if we need to run a hyperparameter search
+            search_sigma = isinstance(sigma, (collections.Sequence, np.ndarray)) and \
+                            (len(sigma) > 1)
+            search_lam = isinstance(lam, (collections.Sequence, np.ndarray)) and \
+                            (len(lam) > 1)
+            if search_sigma | search_lam:
+                print("Running hyperparameter search...")
+                sigma, lam = self.loocv(X_tr, D_tr, X_te, D_te, sigma, lam)
+            else:
+                if isinstance(sigma, (collections.Sequence, np.ndarray)):
+                    sigma = sigma[0]
+                if isinstance(lam, (collections.Sequence, np.ndarray)):
+                    lam = lam[0]
+                    
+            print("Computing optimal solution...")    
+            X_tr = self.gaussian_kernel(D_tr, sigma)  # shape (t, n_tr)
+            X_te = self.gaussian_kernel(D_te, sigma) # shape (t, n_te)
+            H, h = self.kernel_arrays(X_tr, X_te) # shapes (t, t) and (t, 1)
+            alpha = (H + (lam * torch.eye(t)).to(DEVICE)).inverse().mm(h) # shape (t, 1)
+            self.alpha_ = torch.max(torch.zeros(1).to(DEVICE), alpha) # shape (t, 1)
+            self.sigma_ = sigma
+            print("Done!")
         
     
     def predict(self,
@@ -358,23 +311,25 @@ class uLSIF(object):
             w[i] corresponds to importance weight of X[i]
         """
         
-        assert self.alpha_ is not None, "Need to run fit method before calling predict!"
+        with torch.no_grad():
         
-        # convert data to torch tensors
-        X = torch.from_numpy(X).float().to(DEVICE)
-        
-        # compute the squared l2-norm of the difference between 
-        # every point in X and every point in C,
-        # element (l, i) should contain the squared l2-norm
-        # between C[l] and X[i]
-        D = self.pairwise_euclidean_distance_squared(self.C_, X) # shape (t, n)
-        
-        # compute gaussian kernel
-        X = self.gaussian_kernel(D, self.sigma_)  # shape (t, n_tr)
-        
-        # compute importance weights
-        w = self.alpha_.t().mm(X).squeeze().cpu().numpy() # shape (n_tr,) 
-        
+            assert self.alpha_ is not None, "Need to run fit method before calling predict!"
+            
+            # convert data to torch tensors
+            X = torch.from_numpy(X).float().to(DEVICE)
+            
+            # compute the squared l2-norm of the difference between 
+            # every point in X and every point in C,
+            # element (l, i) should contain the squared l2-norm
+            # between C[l] and X[i]
+            D = self.pairwise_euclidean_distance_squared(self.C_, X) # shape (t, n)
+            
+            # compute gaussian kernel
+            X = self.gaussian_kernel(D, self.sigma_)  # shape (t, n_tr)
+            
+            # compute importance weights
+            w = self.alpha_.t().mm(X).squeeze().cpu().numpy() # shape (n_tr,) 
+            
         return w
                 
     
@@ -429,73 +384,75 @@ class uLSIF(object):
             Regularisation strength corresponding to lowest LOOCV loss.            
         """
         
-        # make sure hyperparameter ranges are iterables
-        if not isinstance(sigma_range, (collections.Sequence, np.ndarray)):
-            sigma_range = [sigma_range]
-        if not isinstance(lam_range, (collections.Sequence, np.ndarray)):
-            lam_range = [lam_range]
-            
-        # define some useful variables
-        n_tr, d = X_tr.size()
-        n_te = X_te.size(0)
-        n = min(n_tr, n_te)
-        t = min(self.n_kernels, n_te) 
-        ones_t = torch.ones((t, 1), device=DEVICE)
-        ones_n = torch.ones((n, 1), device=DEVICE)
-        diag_n_idx = torch.cat((torch.range(0, n-1).view(1, -1).long(), torch.range(0, n-1).view(1, -1).long()))
-        losses = np.zeros((len(sigma_range), len(lam_range)))
+        with torch.no_grad():
         
-        # for each candidate of Gaussian kernel width...
-        for sigma_idx, sigma in enumerate(sigma_range):
+            # make sure hyperparameter ranges are iterables
+            if not isinstance(sigma_range, (collections.Sequence, np.ndarray)):
+                sigma_range = [sigma_range]
+            if not isinstance(lam_range, (collections.Sequence, np.ndarray)):
+                lam_range = [lam_range]
+                
+            # define some useful variables
+            n_tr, d = X_tr.size()
+            n_te = X_te.size(0)
+            n = min(n_tr, n_te)
+            t = min(self.n_kernels, n_te) 
+            ones_t = torch.ones((t, 1), device=DEVICE)
+            ones_n = torch.ones((n, 1), device=DEVICE)
+            diag_n_idx = torch.cat((torch.range(0, n-1).view(1, -1).long(), torch.range(0, n-1).view(1, -1).long()))
+            losses = np.zeros((len(sigma_range), len(lam_range)))
             
-            # apply the Guassian kernel function to the elements of D_tr and D_te
-            # reuse variables X_tr and X_te as we won't need the originals again
-            X_tr = self.gaussian_kernel(D_tr, sigma) # shape (t, n_tr)
-            X_te = self.gaussian_kernel(D_te, sigma)  # shape (t, n_te)
-            
-            # compute kernel arrays
-            H, h = self.kernel_arrays(X_tr, X_te) # shapes (t, t) and (t, 1)
-            
-            # for what follows X_tr and X_te must have the same shape,
-            # so choose n points randomly from each
-            X_tr = X_tr[:, np.random.choice(n_tr, n, replace=False)] # shape (t, n)
-            X_te = X_te[:, np.random.choice(n_te, n, replace=False)] # shape (t, n)
-            
-            # for each candidate of regularisation parameter...
-            for lam_idx, lam in enumerate(lam_range):
+            # for each candidate of Gaussian kernel width...
+            for sigma_idx, sigma in enumerate(sigma_range):
                 
-                # compute the t x t matrix B
-                B = H + torch.eye(t, device=DEVICE) * (lam * (n_tr - 1)) / n_tr # shape (t, t)
+                # apply the Guassian kernel function to the elements of D_tr and D_te
+                # reuse variables X_tr and X_te as we won't need the originals again
+                X_tr = self.gaussian_kernel(D_tr, sigma) # shape (t, n_tr)
+                X_te = self.gaussian_kernel(D_te, sigma)  # shape (t, n_te)
                 
-                # compute the t x n matrix B_0           
-                B_inv = B.inverse() # shape (t, t)
-                B_inv_X_tr = B_inv.mm(X_tr) # shape (t, n)
-                diag_num = h.t().mm(B_inv_X_tr).squeeze() # shape (n,)
-                diag_denom = (n_tr * ones_n.t() - ones_t.t().mm(X_tr * B_inv_X_tr)).squeeze() # shape (n,) 
-                diag_sparse = torch.sparse.FloatTensor(diag_n_idx, (diag_num / diag_denom).cpu(), torch.Size([n, n])).to(DEVICE) # sparse (n, n)
-                B_0 = B_inv.mm(h).mm(ones_n.t()) + (diag_sparse.t().mm(B_inv_X_tr.t())).t() # shape (t, n)
+                # compute kernel arrays
+                H, h = self.kernel_arrays(X_tr, X_te) # shapes (t, t) and (t, 1)
                 
-                # compute B_1
-                diag_num = ones_t.t().mm(X_te * B_inv_X_tr).squeeze() # shape (n,)
-                diag_sparse = torch.sparse.FloatTensor(diag_n_idx, (diag_num / diag_denom).cpu(), torch.Size([n, n])).to(DEVICE) # sparse (n, n)
-                B_1 = B_inv.mm(X_te) + (diag_sparse.t().mm(B_inv_X_tr.t())).t() # shape (t, n)
-    
-                # compute B_2
-                B_2 = ((n_tr - 1) / (n_tr * (n_te - 1))) * (n_te * B_0 - B_1) # shape (t, n)              
-                B_2 = torch.max(torch.zeros(1).to(DEVICE), B_2) # shape (t, n) 
+                # for what follows X_tr and X_te must have the same shape,
+                # so choose n points randomly from each
+                X_tr = X_tr[:, np.random.choice(n_tr, n, replace=False)] # shape (t, n)
+                X_te = X_te[:, np.random.choice(n_te, n, replace=False)] # shape (t, n)
                 
-                # compute leave-one-out CV loss
-                loss_1 = ((X_tr * B_2).t().mm(ones_t).pow(2).sum() / (2 * n)).item()
-                loss_2 = (ones_t.t().mm(X_te * B_2).mm(ones_n) / n).item()          
-                losses[sigma_idx, lam_idx] = loss_1 - loss_2        
-                print("sigma = {:0.5f}, lambda = {:0.5f}, loss = {:0.5f}".format(
-                        sigma, lam, losses[sigma_idx, lam_idx]))
-                
-        # get best hyperparameters        
-        sigma_idx, lam_idx = np.unravel_index(np.argmin(losses), losses.shape)
-        sigma_hat, lam_hat = sigma_range[sigma_idx], lam_range[lam_idx]   
-        print("\nbest loss = {:0.5f} for sigma = {:0.5f} and lambda = {:0.5f}".format(
-                losses[sigma_idx, lam_idx], sigma_hat, lam_hat))
+                # for each candidate of regularisation parameter...
+                for lam_idx, lam in enumerate(lam_range):
+                    
+                    # compute the t x t matrix B
+                    B = H + torch.eye(t, device=DEVICE) * (lam * (n_tr - 1)) / n_tr # shape (t, t)
+                    
+                    # compute the t x n matrix B_0           
+                    B_inv = B.inverse() # shape (t, t)
+                    B_inv_X_tr = B_inv.mm(X_tr) # shape (t, n)
+                    diag_num = h.t().mm(B_inv_X_tr).squeeze() # shape (n,)
+                    diag_denom = (n_tr * ones_n.t() - ones_t.t().mm(X_tr * B_inv_X_tr)).squeeze() # shape (n,) 
+                    diag_sparse = torch.sparse.FloatTensor(diag_n_idx, (diag_num / diag_denom).cpu(), torch.Size([n, n])).to(DEVICE) # sparse (n, n)
+                    B_0 = B_inv.mm(h).mm(ones_n.t()) + (diag_sparse.t().mm(B_inv_X_tr.t())).t() # shape (t, n)
+                    
+                    # compute B_1
+                    diag_num = ones_t.t().mm(X_te * B_inv_X_tr).squeeze() # shape (n,)
+                    diag_sparse = torch.sparse.FloatTensor(diag_n_idx, (diag_num / diag_denom).cpu(), torch.Size([n, n])).to(DEVICE) # sparse (n, n)
+                    B_1 = B_inv.mm(X_te) + (diag_sparse.t().mm(B_inv_X_tr.t())).t() # shape (t, n)
+        
+                    # compute B_2
+                    B_2 = ((n_tr - 1) / (n_tr * (n_te - 1))) * (n_te * B_0 - B_1) # shape (t, n)              
+                    B_2 = torch.max(torch.zeros(1).to(DEVICE), B_2) # shape (t, n) 
+                    
+                    # compute leave-one-out CV loss
+                    loss_1 = ((X_tr * B_2).t().mm(ones_t).pow(2).sum() / (2 * n)).item()
+                    loss_2 = (ones_t.t().mm(X_te * B_2).mm(ones_n) / n).item()          
+                    losses[sigma_idx, lam_idx] = loss_1 - loss_2        
+                    print("sigma = {:0.5f}, lambda = {:0.5f}, loss = {:0.5f}".format(
+                            sigma, lam, losses[sigma_idx, lam_idx]))
+                    
+            # get best hyperparameters        
+            sigma_idx, lam_idx = np.unravel_index(np.argmin(losses), losses.shape)
+            sigma_hat, lam_hat = sigma_range[sigma_idx], lam_range[lam_idx]   
+            print("\nbest loss = {:0.5f} for sigma = {:0.5f} and lambda = {:0.5f}".format(
+                    losses[sigma_idx, lam_idx], sigma_hat, lam_hat))
         
         return sigma_hat, lam_hat
     
