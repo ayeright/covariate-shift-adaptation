@@ -142,6 +142,98 @@ class PCIF(object):
             w = (self.n_tr_ / self.n_te_) * (p[:, 1] / p[:, 0])
             
         return w
+    
+    
+class NNIF(object):
+    """
+    Neural Network Importance Fitting.
+    
+    Trains a pytorch neural network to distinguish between samples from 
+    training and test distributions. Then given a feature vector x, we can use 
+    the trained network along with Bayes' rule to estimate the probability 
+    density ratio w(x) as follows:
+        
+    w(x) = n_tr * p(test|x) / n_te * p(train|x),
+    
+    where n_tr and n_te are the number of training and test samples used to
+    fit the model respectively, and p(train|x) and p(test|x) are the 
+    probabilities that x was sampled from the training and test distributions
+    respectively, as predicted by the trained network.
+    
+    Attributes
+    ----------
+    
+    n_tr_: integer
+        Number of samples from training distribution used to fit the model.
+           
+    n_te_: integer
+        Number of samples from test distribution used to fit the model.
+           
+    estimator_: pytorch model
+        Fitted neural network.
+    """
+
+    def __init__(self):
+        
+        # attributes
+        self.n_tr_ = None
+        self.n_te_ = None
+        self.estimator_ = None
+        
+    
+    def fit(self,
+            estimator,
+            X_tr,
+            X_te):
+        """
+        Fits a pytorch neural network to the input training and test data
+        to predict p(test|x).
+        
+        Parameters
+        ----------
+        
+        estimator: pytorch model
+        
+        X_tr: numpy array
+            Input data from training distribution, where each row is a feature vector.
+            
+        X_te: numpy array
+            Input data from test distribution, where each row is a feature vector.
+        """
+        
+        pass
+               
+    
+    def predict(self,
+                X):
+        """
+        Estimates importance weights for input data.
+        
+        For each feature vector x, the trained neural network 
+        is used to estimate the probability density ratio
+            
+        w(x) = n_tr * p(test|x) / n_te * p(train|x),
+        
+        where n_tr and n_te are the number of training and test samples used to
+        train the model respectively, and p(train|x) and p(test|x) are the
+        probabilities that x was sampled from the training and test distributions
+        respectively, as predicted by the trained network.
+        
+        Parameters
+        ----------
+        
+        X: numpy array
+            Input data, where each row is a feature vector.
+            
+        Returns
+        -------
+        
+        w: numpy vector of shape (len(X),)
+            Estimated importance weight for each input. 
+            w[i] corresponds to importance weight of X[i]
+        """
+        
+        pass
 
     
 class uLSIF(object):
