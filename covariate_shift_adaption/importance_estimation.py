@@ -7,11 +7,37 @@ Created on Mon Jul  9 16:18:13 2018
 
 import numpy as np
 import torch
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+from torch_general_utils import pairwise_distances_squared, gaussian_kernel
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, StratifiedKFold
 import collections
+import sys
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+
+def importance_weights(X,
+                       n_tr, 
+                       n_te,
+                       estimator=None,
+                       p=None,
+                       logits=None):
+    
+    if estimator is not None:   
+        p = estimator.predict_proba(X)
+        if len(p.shape) == 1:
+            w = (n_tr / n_te) * (p / (1 - p))
+        else:
+            w = (n_tr / n_te) * (p[:, 1] / p[:, 0])            
+    elif p is not None:        
+        w = (n_tr / n_te) * (p / (1 - p))        
+    elif logits is not None:        
+        w = (n_tr / n_te) * np.exp(logits)        
+    else:
+        w = None
+        
+    return w
+        
+        
 class PCIF(object):
     """
     Probabilistic Classifier Importance Fitting.
@@ -47,6 +73,9 @@ class PCIF(object):
         self.n_tr_ = None
         self.n_te_ = None
         self.estimator_ = None
+        self.cv_results_ = None
+        self.best_score_ = None
+        self.best_params_ = None
         
     
     def fit(self,
@@ -92,12 +121,15 @@ class PCIF(object):
         # fit estimator
         if isinstance(estimator, GridSearchCV) or isinstance(estimator, RandomizedSearchCV):
             print("Running model selection...")
-            estimator.refit = True
-            estimator.fit(X, y)
-            print("Done!")
+            if estimator.refit == False:
+                estimator.refit = True    
+            estimator.fit(X, y)           
             print("Best score = {}".format(estimator.best_score_))
-            print("Using best estimator.") 
-            self.estimator_ = estimator.best_estimator_
+            self.cv_results_ = estimator.cv_results_
+            self.estimator_ = estimator.best_estimator_                 
+            self.best_score_ = estimator.best_score_
+            self.best_params_ = estimator.best_params_
+            print("Done!")
         else:
             print("Fitting estimator...")
             self.estimator_ = estimator.fit(X, y)
@@ -134,15 +166,41 @@ class PCIF(object):
         """
         
         assert self.estimator_ is not None, "Need to run fit method before calling predict!"
-               
-        p = self.estimator_.predict_proba(X)
-        if len(p.shape) == 1:
-            w = (self.n_tr_ / self.n_te_) * (p / (1 - p))
-        else:
-            w = (self.n_tr_ / self.n_te_) * (p[:, 1] / p[:, 0])
-            
+          
+        w = importance_weights(X, self.n_tr_, self.n_te_, estimator=self.estimator_)
         return w
     
+    
+    def fit_predict_oos(self,
+                        estimator,
+                        X_tr,
+                        X_te,
+                        n_splits=5):
+        
+        # stack features and construct the target (1 if test, 0 if train)
+        X = np.vstack((X_tr, X_te))
+        y = np.concatenate((np.zeros(X_tr.shape[0]), np.ones(X_te.shape[0])))
+    
+        # split the data into n_splits folds, and for 1 to n_splits,
+        # train on (n_splits - 1)-folds and use the fitted estimator to
+        # predict weights for the other fold
+        w = np.zeros_like(y)
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True)
+        for idx_tr, idx_te in skf.split(X, y):
+            
+            # fit on (n_splits - 1)-folds
+            estimator.fit(X[idx_tr], y[idx_tr])
+            
+            # predict weights for other fold         
+            n_tr = (y[idx_tr] == 0).sum()
+            n_te = (y[idx_tr] == 1).sum()
+            w[idx_te] = importance_weights(X[idx_te], n_tr, n_te, estimator=estimator)
+        
+        # split into training and test weights           
+        w_tr = w[y == 0]
+        w_te = w[y == 1]         
+        return w_tr, w_te
+        
     
 class NNIF(object):
     """
@@ -184,7 +242,8 @@ class NNIF(object):
     def fit(self,
             estimator,
             X_tr,
-            X_te):
+            X_te,
+            num_epochs=10):
         """
         Fits a pytorch neural network to the input training and test data
         to predict p(test|x).
@@ -201,8 +260,46 @@ class NNIF(object):
             Input data from test distribution, where each row is a feature vector.
         """
         
-        pass
-               
+        # convert training and test data to torch tensors
+        X_tr = torch.from_numpy(X_tr).float().to(DEVICE)
+        X_te = torch.from_numpy(X_te).float().to(DEVICE)
+        
+        # construct the target (1 if test, 0 if train)
+        self.n_tr_ = X_tr.size(0)
+        self.n_te_ = X_te.size(0)
+        n = self.n_tr_ + self.n_te_
+        y = torch.cat((torch.zeros(self.n_tr_), torch.ones(self.n_te_))).to(DEVICE)
+    
+        # stack and shuffle features and target
+        X = torch.cat((X_tr, X_te))
+        i_shuffle = np.random.choice(n, n, replace=False)
+        X = X[i_shuffle]
+        y = y[i_shuffle]
+        
+        # split into training and validation data
+        X_tr = X[:int(n * 0.8)]
+        y_tr = y[:int(n * 0.8)]
+        X_te = X[int(n * 0.8):]
+        y_te = y[int(n * 0.8):]
+        
+        self.n_te_ = y_tr.sum().item()
+        self.n_tr_ = y_tr.size(0) - self.n_te_
+
+        # fit estimator
+        print("Running model selection...")
+        estimator.fit(X_tr,
+                     y_tr,
+                     X_te,
+                     y_te,
+                     num_experiments=1,
+                     num_trials=10,
+                     batch_size=4096,
+                     num_epochs=100,
+                     patience=10,
+                     verbose=True)
+        self.estimator_ = estimator.best_estimator_
+        print("Done!")
+        
     
     def predict(self,
                 X):
@@ -233,7 +330,15 @@ class NNIF(object):
             w[i] corresponds to importance weight of X[i]
         """
         
-        pass
+        assert self.estimator_ is not None, "Need to run fit method before calling predict!"
+          
+        with torch.no_grad():
+            
+            X = torch.from_numpy(X).float().to(DEVICE)
+            self.estimator_.eval()             
+            w = (self.n_tr_ / self.n_te_) * torch.exp(self.estimator_(X))
+            
+        return w.cpu().numpy()
 
     
 class uLSIF(object):
@@ -346,11 +451,11 @@ class uLSIF(object):
             # element (l, i) should contain the squared l2-norm
             # between C[l] and X_tr[i]
             print("Computing distance matrix for X_train...")
-            D_tr = self.pairwise_euclidean_distance_squared(self.C_, X_tr) # shape (t, n_tr)
+            D_tr = pairwise_distances_squared(self.C_, X_tr) # shape (t, n_tr)
         
             # do the same for X_te
             print("Computing distance matrix for X_test...")
-            D_te = self.pairwise_euclidean_distance_squared(self.C_, X_te) # shape (t, n_te)        
+            D_te = pairwise_distances_squared(self.C_, X_te) # shape (t, n_te)        
             
             # check if we need to run a hyperparameter search
             search_sigma = isinstance(sigma, (collections.Sequence, np.ndarray)) and \
@@ -367,8 +472,8 @@ class uLSIF(object):
                     lam = lam[0]
                     
             print("Computing optimal solution...")    
-            X_tr = self.gaussian_kernel(D_tr, sigma)  # shape (t, n_tr)
-            X_te = self.gaussian_kernel(D_te, sigma) # shape (t, n_te)
+            X_tr = gaussian_kernel(D_tr, sigma)  # shape (t, n_tr)
+            X_te = gaussian_kernel(D_te, sigma) # shape (t, n_te)
             H, h = self.kernel_arrays(X_tr, X_te) # shapes (t, t) and (t, 1)
             alpha = (H + (lam * torch.eye(t)).to(DEVICE)).inverse().mm(h) # shape (t, 1)
             self.alpha_ = torch.max(torch.zeros(1).to(DEVICE), alpha) # shape (t, 1)
@@ -414,10 +519,10 @@ class uLSIF(object):
             # every point in X and every point in C,
             # element (l, i) should contain the squared l2-norm
             # between C[l] and X[i]
-            D = self.pairwise_euclidean_distance_squared(self.C_, X) # shape (t, n)
+            D = pairwise_distances_squared(self.C_, X) # shape (t, n)
             
             # compute gaussian kernel
-            X = self.gaussian_kernel(D, self.sigma_)  # shape (t, n_tr)
+            X = gaussian_kernel(D, self.sigma_)  # shape (t, n_tr)
             
             # compute importance weights
             w = self.alpha_.t().mm(X).squeeze().cpu().numpy() # shape (n_tr,) 
@@ -497,10 +602,10 @@ class uLSIF(object):
             # for each candidate of Gaussian kernel width...
             for sigma_idx, sigma in enumerate(sigma_range):
                 
-                # apply the Guassian kernel function to the elements of D_tr and D_te
+                # apply the Gaussian kernel function to the elements of D_tr and D_te
                 # reuse variables X_tr and X_te as we won't need the originals again
-                X_tr = self.gaussian_kernel(D_tr, sigma) # shape (t, n_tr)
-                X_te = self.gaussian_kernel(D_te, sigma)  # shape (t, n_te)
+                X_tr = gaussian_kernel(D_tr, sigma) # shape (t, n_tr)
+                X_te = gaussian_kernel(D_te, sigma)  # shape (t, n_te)
                 
                 # compute kernel arrays
                 H, h = self.kernel_arrays(X_tr, X_te) # shapes (t, t) and (t, 1)
@@ -547,85 +652,6 @@ class uLSIF(object):
                     losses[sigma_idx, lam_idx], sigma_hat, lam_hat))
         
         return sigma_hat, lam_hat
-    
-    
-    def pairwise_euclidean_distance_squared(self,
-                                            A, 
-                                            B):
-        
-        """
-        Computes pairwise squared l2-norm between rows of two matrices.
-        
-        Computes the squared l2-norm of the difference between every row in C
-        with every row in X. Element (l, i) of output should contain the 
-        squared l2-norm between C[l] and X[i].
-        
-        - Number of columns must be same in both matrices.
-        
-        Parameters
-        ----------
-        
-        A: torch tensor
-            
-        B: torch tensor
-            
-        Returns
-        -------
-        
-        D: torch tensor
-            Has shape (len(A), len(B)), where D[i, j] is equal to the 
-            squared l2-norm between A[i] and B[j].          
-        """
-        
-        # define some useful variables
-        array_size_limit = 1e8
-        t, d = A.size()
-        n = B.size(0)
-        
-        # reshape the matrices for broadcasting
-        A = A.view(t, d, 1)
-        B = B.t()
-        
-        if n * d * t <= array_size_limit:
-            # do in one go
-            D = (A - B).pow(2).sum(dim=1)
-        else:
-            # do in chunks to avoid memory error
-            D = torch.zeros((t, n)).to(DEVICE)
-            chunk_size = array_size_limit / (d * t)
-            num_chunks = int(np.ceil(n / chunk_size))
-            for chunk in range(num_chunks):
-                first_col = int(chunk * chunk_size)
-                last_col = min(n, int((chunk + 1) * chunk_size))
-                D[:, first_col:last_col] = (A - B[:, first_col:last_col]).pow(2).sum(dim=1) 
-                
-        return D 
-    
-    
-    def gaussian_kernel(self, 
-                        D, 
-                        sigma):
-        """
-        Applies Gaussian kernel element-wise.
-        
-        Computes exp(-d / (2 * (sigma ^ 2))) for each element d in D.
-        
-        Parameters
-        ----------
-        
-        D: torch tensor
-            
-        sigma: scalar
-            Gaussian kernel width.
-            
-        Returns
-        -------
-        
-        torch tensor
-            Result of applying Gaussian kernel to D element-wise.          
-        """
-        
-        return (-D / (2 * (sigma ** 2))).exp()  
     
     
     def kernel_arrays(self,
