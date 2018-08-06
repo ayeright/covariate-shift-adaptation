@@ -7,35 +7,13 @@ Created on Mon Jul  9 16:18:13 2018
 
 import numpy as np
 import torch
-from torch_general_utils import pairwise_distances_squared, gaussian_kernel
+from torch_utils import pairwise_distances_squared, gaussian_kernel
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, StratifiedKFold
 import collections
+from copy import deepcopy
 import sys
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-
-def importance_weights(X,
-                       n_tr, 
-                       n_te,
-                       estimator=None,
-                       p=None,
-                       logits=None):
-    
-    if estimator is not None:   
-        p = estimator.predict_proba(X)
-        if len(p.shape) == 1:
-            w = (n_tr / n_te) * (p / (1 - p))
-        else:
-            w = (n_tr / n_te) * (p[:, 1] / p[:, 0])            
-    elif p is not None:        
-        w = (n_tr / n_te) * (p / (1 - p))        
-    elif logits is not None:        
-        w = (n_tr / n_te) * np.exp(logits)        
-    else:
-        w = None
-        
-    return w
         
         
 class PCIF(object):
@@ -65,6 +43,13 @@ class PCIF(object):
            
     estimator_: estimator with scikit-learn interface
         Fitted probabilistic classifier.
+        
+    cv_results_:
+        
+    best_score_:
+        
+    best_params_:
+        
     """
 
     def __init__(self):
@@ -166,17 +151,35 @@ class PCIF(object):
         """
         
         assert self.estimator_ is not None, "Need to run fit method before calling predict!"
-          
-        w = importance_weights(X, self.n_tr_, self.n_te_, estimator=self.estimator_)
+        
+        p = self.estimator.predict_proba(X)
+        w = importance_weights(p, self.n_tr_, self.n_te_)
+        
         return w
     
     
-    def fit_predict_oos(self,
-                        estimator,
-                        X_tr,
-                        X_te,
-                        n_splits=5):
+    def fit_predict(self,
+                    estimator,
+                    X_tr,
+                    X_te,
+                    X):
         
+        self.fit(estimator, X_tr, X_te)
+        w = self.predict(X)
+        
+        return w
+        
+           
+    def predict_oos(self,
+                    X_tr,
+                    X_te,
+                    estimator=None,
+                    n_splits=5):
+        
+        if estimator is None:
+            assert self.estimator_ is not None, "Either provide an estimator or run fit method first!"
+            estimator = deepcopy(self.estimator_)
+            
         # stack features and construct the target (1 if test, 0 if train)
         X = np.vstack((X_tr, X_te))
         y = np.concatenate((np.zeros(X_tr.shape[0]), np.ones(X_te.shape[0])))
@@ -191,154 +194,35 @@ class PCIF(object):
             # fit on (n_splits - 1)-folds
             estimator.fit(X[idx_tr], y[idx_tr])
             
+            # predict probabilities for other fold
+            p = estimator.predict_proba(X[idx_te])
+            
             # predict weights for other fold         
             n_tr = (y[idx_tr] == 0).sum()
             n_te = (y[idx_tr] == 1).sum()
-            w[idx_te] = importance_weights(X[idx_te], n_tr, n_te, estimator=estimator)
+            w[idx_te] = importance_weights(p, n_tr, n_te)
         
         # split into training and test weights           
         w_tr = w[y == 0]
-        w_te = w[y == 1]         
+        w_te = w[y == 1]
+         
         return w_tr, w_te
         
-    
-class NNIF(object):
-    """
-    Neural Network Importance Fitting.
-    
-    Trains a pytorch neural network to distinguish between samples from 
-    training and test distributions. Then given a feature vector x, we can use 
-    the trained network along with Bayes' rule to estimate the probability 
-    density ratio w(x) as follows:
-        
-    w(x) = n_tr * p(test|x) / n_te * p(train|x),
-    
-    where n_tr and n_te are the number of training and test samples used to
-    fit the model respectively, and p(train|x) and p(test|x) are the 
-    probabilities that x was sampled from the training and test distributions
-    respectively, as predicted by the trained network.
-    
-    Attributes
-    ----------
-    
-    n_tr_: integer
-        Number of samples from training distribution used to fit the model.
-           
-    n_te_: integer
-        Number of samples from test distribution used to fit the model.
-           
-    estimator_: pytorch model
-        Fitted neural network.
-    """
 
-    def __init__(self):
-        
-        # attributes
-        self.n_tr_ = None
-        self.n_te_ = None
-        self.estimator_ = None
-        
+def importance_weights(p,
+                       n_tr,
+                       n_te,
+                       logits=False):
     
-    def fit(self,
-            estimator,
-            X_tr,
-            X_te,
-            num_epochs=10):
-        """
-        Fits a pytorch neural network to the input training and test data
-        to predict p(test|x).
+    if len(p.shape) > 1:
+        p = p[:, 1]
         
-        Parameters
-        ----------
-        
-        estimator: pytorch model
-        
-        X_tr: numpy array
-            Input data from training distribution, where each row is a feature vector.
-            
-        X_te: numpy array
-            Input data from test distribution, where each row is a feature vector.
-        """
-        
-        # convert training and test data to torch tensors
-        X_tr = torch.from_numpy(X_tr).float().to(DEVICE)
-        X_te = torch.from_numpy(X_te).float().to(DEVICE)
-        
-        # construct the target (1 if test, 0 if train)
-        self.n_tr_ = X_tr.size(0)
-        self.n_te_ = X_te.size(0)
-        n = self.n_tr_ + self.n_te_
-        y = torch.cat((torch.zeros(self.n_tr_), torch.ones(self.n_te_))).to(DEVICE)
-    
-        # stack and shuffle features and target
-        X = torch.cat((X_tr, X_te))
-        i_shuffle = np.random.choice(n, n, replace=False)
-        X = X[i_shuffle]
-        y = y[i_shuffle]
-        
-        # split into training and validation data
-        X_tr = X[:int(n * 0.8)]
-        y_tr = y[:int(n * 0.8)]
-        X_te = X[int(n * 0.8):]
-        y_te = y[int(n * 0.8):]
-        
-        self.n_te_ = y_tr.sum().item()
-        self.n_tr_ = y_tr.size(0) - self.n_te_
+    if logits:
+        w = (n_tr / n_te) * np.exp(p)
+    else:
+        w = (n_tr / n_te) * (p / (1 - p))
 
-        # fit estimator
-        print("Running model selection...")
-        estimator.fit(X_tr,
-                     y_tr,
-                     X_te,
-                     y_te,
-                     num_experiments=1,
-                     num_trials=10,
-                     batch_size=4096,
-                     num_epochs=100,
-                     patience=10,
-                     verbose=True)
-        self.estimator_ = estimator.best_estimator_
-        print("Done!")
-        
-    
-    def predict(self,
-                X):
-        """
-        Estimates importance weights for input data.
-        
-        For each feature vector x, the trained neural network 
-        is used to estimate the probability density ratio
-            
-        w(x) = n_tr * p(test|x) / n_te * p(train|x),
-        
-        where n_tr and n_te are the number of training and test samples used to
-        train the model respectively, and p(train|x) and p(test|x) are the
-        probabilities that x was sampled from the training and test distributions
-        respectively, as predicted by the trained network.
-        
-        Parameters
-        ----------
-        
-        X: numpy array
-            Input data, where each row is a feature vector.
-            
-        Returns
-        -------
-        
-        w: numpy vector of shape (len(X),)
-            Estimated importance weight for each input. 
-            w[i] corresponds to importance weight of X[i]
-        """
-        
-        assert self.estimator_ is not None, "Need to run fit method before calling predict!"
-          
-        with torch.no_grad():
-            
-            X = torch.from_numpy(X).float().to(DEVICE)
-            self.estimator_.eval()             
-            w = (self.n_tr_ / self.n_te_) * torch.exp(self.estimator_(X))
-            
-        return w.cpu().numpy()
+    return w    
 
     
 class uLSIF(object):
